@@ -1,0 +1,55 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vk-ssh-controller
+  namespace: vk-ssh
+  labels:
+    app: vk-ssh-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vk-ssh-controller
+  template:
+    metadata:
+      labels:
+        app: vk-ssh-controller
+    spec:
+      serviceAccountName: vk-ssh-controller
+      containers:
+        - name: controller
+          image: your-registry/k8s-remote-node:latest
+          imagePullPolicy: Always
+          env:
+            - name: SSH_HOST
+              value: "192.168.1.201"         # 替换为你的远程节点 IP
+            - name: SSH_USER
+              value: "root"
+            - name: SSH_KEY_PATH
+              value: "/etc/ssh-key/id_rsa"
+            - name: VK_NODE_NAME
+              value: "ssh-node-192-168-1-201" # 替换为你的节点名
+            - name: WORK_DIR
+              value: "/opt/vk-pods"
+            # 可选: TLS 证书（用于 kubectl logs / exec）
+            # - name: TLS_CERT_FILE
+            #   value: "/etc/vk-tls/tls.crt"
+            # - name: TLS_KEY_FILE
+            #   value: "/etc/vk-tls/tls.key"
+          volumeMounts:
+            - name: ssh-key
+              mountPath: /etc/ssh-key
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: ssh-key
+          secret:
+            secretName: ssh-key
+            defaultMode: 0600
