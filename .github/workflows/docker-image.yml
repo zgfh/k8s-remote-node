@@ -1,26 +1,43 @@
-name: Build and Push Multi-arch Image
+name: Build and Push Multi-arch Image (Parallel)
 
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]          # 打 v 开头的 tag 也会触发构建
-  workflow_dispatch:         # 支持在 Actions 页面手动触发
+    tags: [ 'v*' ]
+  workflow_dispatch:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
-  build-and-push-multiarch:
-    runs-on: ubuntu-latest
+  # === 第一步：并行构建单体架构镜像 ===
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            # 标准的 x86 runner，速度快
+            runner: ubuntu-latest 
+          - arch: arm64
+            platform: linux/arm64
+            # 关键优化点：
+            # 1. 如果你有原生 ARM runner，改成 runs-on: ubuntu-24.04-arm (最快)
+            # 2. 如果没有，暂时保持 ubuntu-latest (虽然慢，但并行运行不阻塞总时间)
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
+      packages: write
       contents: read
-      packages: write        # 推送 GHCR 必需
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up QEMU
+        # 只有在 x86 机器上构建 arm64 时才需要 QEMU
+        # 如果 runner 已经是 arm64，这一步会自动跳过或不产生影响
+        if: matrix.arch == 'arm64' && matrix.runner == 'ubuntu-latest'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -33,7 +50,47 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
+      # 关键：生成一个临时的 Tag，包含架构信息，避免覆盖
+      # 例如: ghcr.io/user/repo:sha-abc123-arm64
+      - name: Generate Temp Tag
+        id: tag
+        run: echo "temp_tag=${{ env.IMAGE_NAME }}:build-${{ github.sha }}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push Single Arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.tag.outputs.temp_tag }}
+          # 这里一定要关掉 provenance，否则合并时会因为 attestation 报错
+          provenance: false
+          # 缓存配置
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  # === 第二步：合并 Manifest 并推送最终 Tag ===
+  manifest:
+    needs: build # 等待 build 矩阵中的两个任务都完成
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 准备最终的 Tag 列表
+      - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -41,18 +98,24 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: false
+      - name: Create and Push Manifest
+        run: |
+          # 构建最终的 docker buildx imagetools create 命令
+          # 它会把两个临时镜像合并，打上最终的标签
+          
+          SOURCES="${{ env.IMAGE_NAME }}:build-${{ github.sha }}-amd64 ${{ env.IMAGE_NAME }}:build-${{ github.sha }}-arm64"
+          TAGS="${{ steps.meta.outputs.tags }}"
+          
+          # 构建 imagetools 命令参数
+          CMD_ARGS=""
+          for TAG in $TAGS; do
+            CMD_ARGS="$CMD_ARGS -t $TAG"
+          done
+          
+          echo "Merging manifests..."
+          docker buildx imagetools create $CMD_ARGS $SOURCES
+          
+          # 清理临时镜像（可选，GHCR 会自动清理或保留，视需求而定）
+          # 这里为了安全起见，主要关注合并结果
+

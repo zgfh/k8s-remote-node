@@ -25,6 +25,7 @@ type ComposeService struct {
 	DependsOn   []string       `yaml:"depends_on,omitempty"`
 	Command     []string       `yaml:"command,omitempty"`
 	Entrypoint  []string       `yaml:"entrypoint,omitempty"`
+	NetworkMode string         `yaml:"network_mode,omitempty"`
 }
 
 // ComposeDeploy specifies deployment resource constraints.
@@ -91,17 +92,24 @@ func convertContainer(c corev1.Container, pod *corev1.Pod, isInit bool) ComposeS
 		Restart: restartPolicy(pod.Spec.RestartPolicy, isInit),
 	}
 
+	// hostNetwork maps to docker network_mode: host
+	if pod.Spec.HostNetwork {
+		svc.NetworkMode = "host"
+	}
+
 	// Environment variables
 	for _, env := range c.Env {
 		svc.Environment = append(svc.Environment, fmt.Sprintf("%s=%s", env.Name, env.Value))
 	}
 
-	// Ports
-	for _, p := range c.Ports {
-		if p.HostPort > 0 {
-			svc.Ports = append(svc.Ports, fmt.Sprintf("%d:%d", p.HostPort, p.ContainerPort))
-		} else {
-			svc.Ports = append(svc.Ports, fmt.Sprintf("%d", p.ContainerPort))
+	// Ports (skip when hostNetwork=true; network_mode: host doesn't support port mapping)
+	if !pod.Spec.HostNetwork {
+		for _, p := range c.Ports {
+			if p.HostPort > 0 {
+				svc.Ports = append(svc.Ports, fmt.Sprintf("%d:%d", p.HostPort, p.ContainerPort))
+			} else {
+				svc.Ports = append(svc.Ports, fmt.Sprintf("%d", p.ContainerPort))
+			}
 		}
 	}
 
