@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	statsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	dto "github.com/prometheus/client_model/go"
 
@@ -28,11 +30,13 @@ import (
 // uploads them via SFTP to a remote node, and manages containers
 // via docker compose commands over SSH.
 type ComposeProvider struct {
-	cfg        config.Config
-	sshClient  *remote.SSHClient
-	syncClient *remote.SyncClient
-	notifyFunc func(*corev1.Pod)
-	pods       sync.Map // namespace/name → *corev1.Pod
+	cfg             config.Config
+	configMapLister corev1listers.ConfigMapLister
+	secretLister    corev1listers.SecretLister
+	sshClient       *remote.SSHClient
+	syncClient      *remote.SyncClient
+	notifyFunc      func(*corev1.Pod)
+	pods            sync.Map // namespace/name → *corev1.Pod
 }
 
 // Ensure interface compliance at compile time.
@@ -40,11 +44,13 @@ var _ nodeutil.Provider = (*ComposeProvider)(nil)
 
 // NewComposeProvider creates a new provider for managing pods on a remote node.
 // SSH connection is established lazily on first use.
-func NewComposeProvider(cfg config.Config) (*ComposeProvider, error) {
+func NewComposeProvider(cfg config.Config, pc nodeutil.ProviderConfig) (*ComposeProvider, error) {
 	return &ComposeProvider{
-		cfg:        cfg,
-		sshClient:  remote.NewSSHClient(cfg.Host, cfg.DefaultPort(), cfg.User, cfg.SSHKeyPath),
-		syncClient: remote.NewSyncClient(cfg.Host, cfg.DefaultPort(), cfg.User, cfg.SSHKeyPath),
+		cfg:             cfg,
+		configMapLister: pc.ConfigMaps,
+		secretLister:    pc.Secrets,
+		sshClient:       remote.NewSSHClient(cfg.Host, cfg.DefaultPort(), cfg.User, cfg.SSHKeyPath),
+		syncClient:      remote.NewSyncClient(cfg.Host, cfg.DefaultPort(), cfg.User, cfg.SSHKeyPath),
 	}, nil
 }
 
@@ -344,13 +350,66 @@ func (p *ComposeProvider) resolveVolumes(ctx context.Context, pod *corev1.Pod) (
 	for _, vol := range pod.Spec.Volumes {
 		switch {
 		case vol.ConfigMap != nil:
-			logger.WithField("configmap", vol.ConfigMap.Name).Debug("Resolving ConfigMap volume")
+			cm, err := p.configMapLister.ConfigMaps(pod.Namespace).Get(vol.ConfigMap.Name)
+			if err != nil {
+				logger.WithError(err).WithField("configmap", vol.ConfigMap.Name).Error("Failed to fetch ConfigMap")
+				return nil, fmt.Errorf("fetch configmap %s/%s: %w", pod.Namespace, vol.ConfigMap.Name, err)
+			}
+			for key, data := range cm.Data {
+				if !includeVolumeKey(vol.ConfigMap.Items, key) {
+					continue
+				}
+				relPath := filepath.Join("volumes", vol.Name, key)
+				files = append(files, remote.ExtraFile{
+					Path:    relPath,
+					Content: []byte(data),
+				})
+				logger.WithFields(log.Fields{
+					"configmap": vol.ConfigMap.Name,
+					"key":       key,
+					"path":      relPath,
+				}).Debug("Resolved ConfigMap key")
+			}
+			for key, data := range cm.BinaryData {
+				if !includeVolumeKey(vol.ConfigMap.Items, key) {
+					continue
+				}
+				relPath := filepath.Join("volumes", vol.Name, key)
+				files = append(files, remote.ExtraFile{
+					Path:    relPath,
+					Content: data,
+				})
+				logger.WithFields(log.Fields{
+					"configmap": vol.ConfigMap.Name,
+					"key":       key,
+					"path":      relPath,
+				}).Debug("Resolved ConfigMap binary key")
+			}
 		case vol.Secret != nil:
-			logger.WithField("secret", vol.Secret.SecretName).Debug("Resolving Secret volume")
+			secret, err := p.secretLister.Secrets(pod.Namespace).Get(vol.Secret.SecretName)
+			if err != nil {
+				logger.WithError(err).WithField("secret", vol.Secret.SecretName).Error("Failed to fetch Secret")
+				return nil, fmt.Errorf("fetch secret %s/%s: %w", pod.Namespace, vol.Secret.SecretName, err)
+			}
+			for key, data := range secret.Data {
+				if !includeVolumeKey(vol.Secret.Items, key) {
+					continue
+				}
+				relPath := filepath.Join("volumes", vol.Name, key)
+				files = append(files, remote.ExtraFile{
+					Path:    relPath,
+					Content: data,
+				})
+				logger.WithFields(log.Fields{
+					"secret": vol.Secret.SecretName,
+					"key":    key,
+					"path":   relPath,
+				}).Debug("Resolved Secret key")
+			}
 		case vol.EmptyDir != nil:
-			dirName := fmt.Sprintf("volumes/%s", vol.Name)
+			dirName := filepath.Join("volumes", vol.Name)
 			files = append(files, remote.ExtraFile{
-				Path:    dirName + "/.gitkeep",
+				Path:    filepath.Join(dirName, ".gitkeep"),
 				Content: []byte{},
 			})
 			logger.WithField("emptydir", vol.Name).Debug("Created EmptyDir placeholder")
@@ -358,8 +417,22 @@ func (p *ComposeProvider) resolveVolumes(ctx context.Context, pod *corev1.Pod) (
 			logger.WithField("volume", vol.Name).Debug("Unknown volume type")
 		}
 	}
-	logger.WithField("file_count", len(files)).Debug("Volumes resolved")
+	logger.WithField("file_count", len(files)).Info("Volumes resolved")
 	return files, nil
+}
+
+// includeVolumeKey checks whether a key should be included based on the optional
+// items list in the volume source. If items is empty or nil, all keys are included.
+func includeVolumeKey(items []corev1.KeyToPath, key string) bool {
+	if len(items) == 0 {
+		return true
+	}
+	for _, item := range items {
+		if item.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 // composeContainer represents a single container entry from "docker compose ps --format json".

@@ -66,6 +66,8 @@ flowchart TB
 
 ### 1. Deploy RBAC & virtual node
 
+注: 推荐直接通过claude 或codex 等 进行安装（打开cli后输入: 根据文档帮我部署https://github.com/zgfh/k8s-remote-node,如果缺少信息询问我）
+
 ```bash
 kubectl apply -f deploy/rbac.yaml
 kubectl apply -f deploy/ssh-secret.yaml

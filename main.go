@@ -59,7 +59,7 @@ func main() {
 	tlsCertFile := getEnv("TLS_CERT_FILE", "/etc/vk-tls/tls.crt")
 	tlsKeyFile := getEnv("TLS_KEY_FILE", "/etc/vk-tls/tls.key")
 
-	nodeSpec := buildNodeSpec(nodeName)
+	nodeSpec := buildNodeSpec(nodeName, cfg.Host)
 	nodeSpec.Status.Capacity = corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse(getEnv("NODE_CAPACITY_CPU", "8")),
 		corev1.ResourceMemory: resource.MustParse(getEnv("NODE_CAPACITY_MEMORY", "16Gi")),
@@ -91,7 +91,7 @@ func main() {
 	n, err := nodeutil.NewNode(
 		nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-			p, err := provider.NewComposeProvider(cfg)
+			p, err := provider.NewComposeProvider(cfg, pc)
 			if err != nil {
 				log.G(ctx).WithError(err).Error("Failed to create ComposeProvider")
 				return nil, nil, fmt.Errorf("create provider: %w", err)
@@ -140,7 +140,7 @@ func tlsFilesExist(cert, key string) bool {
 	return e1 == nil && e2 == nil
 }
 
-func buildNodeSpec(name string) corev1.Node {
+func buildNodeSpec(name, host string) corev1.Node {
 	return corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -161,6 +161,12 @@ func buildNodeSpec(name string) corev1.Node {
 			},
 		},
 		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{
+					Type:    corev1.NodeInternalIP,
+					Address: host,
+				},
+			},
 			NodeInfo: corev1.NodeSystemInfo{
 				OperatingSystem: "linux",
 				Architecture:    "amd64",

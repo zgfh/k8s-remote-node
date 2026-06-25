@@ -1,3 +1,28 @@
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nginx-secret
+type: Opaque
+data:
+  username: YWRtaW4=        # "admin"
+  password: cGFzc3dvcmQxMjM= # "password123"
+  token: dGVzdC10b2tlbg==   # "test-token"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name localhost;
+        location / {
+            root /usr/share/nginx/html;
+            index index.html;
+        }
+    }
 ---
 apiVersion: v1
 kind: Pod
@@ -23,3 +48,23 @@ spec:
         limits:
           cpu: "0.5"
           memory: "512Mi"
+      volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+        - name: secret
+          mountPath: /etc/secret
+        - name: cache
+          mountPath: /tmp/cache
+
+  volumes:
+    - name: config
+      configMap:
+        name: nginx-config
+        items:
+          - key: default.conf
+            path: site.conf
+    - name: secret
+      secret:
+        secretName: nginx-secret
+    - name: cache
+      emptyDir: {}

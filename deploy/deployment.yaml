@@ -19,7 +19,7 @@ spec:
       serviceAccountName: vk-ssh-controller
       containers:
         - name: controller
-          image: your-registry/k8s-remote-node:latest
+          image: ghcr.nju.edu.cn/zgfh/k8s-remote-node:latest # ghcr.io/zgfh/k8s-remote-node:latest
           imagePullPolicy: Always
           env:
             - name: SSH_HOST
