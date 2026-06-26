@@ -88,21 +88,24 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	var composeProv *provider.ComposeProvider
+
 	n, err := nodeutil.NewNode(
 		nodeName,
 		func(pc nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-			p, err := provider.NewComposeProvider(cfg, pc)
+			var err error
+			composeProv, err = provider.NewComposeProvider(cfg, pc)
 			if err != nil {
 				log.G(ctx).WithError(err).Error("Failed to create ComposeProvider")
 				return nil, nil, fmt.Errorf("create provider: %w", err)
 			}
-			np := provider.NewSSHNodeProvider(p.SSHClient())
+			np := provider.NewSSHNodeProvider(composeProv.SSHClient())
 			if pc.Node != nil {
 				pc.Node.Status.Capacity = nodeSpec.Status.Capacity
 				pc.Node.Status.NodeInfo = nodeSpec.Status.NodeInfo
 			}
 			log.G(ctx).Info("Provider initialized")
-			return p, np, nil
+			return composeProv, np, nil
 		},
 		nodeutil.WithNodeConfig(nodeutil.NodeConfig{
 			NodeSpec:              nodeSpec,
@@ -124,6 +127,9 @@ func main() {
 	}
 
 	log.G(ctx).Info("Node created, starting controllers")
+
+	// Start ConfigMap watcher for automatic volume re-sync on ConfigMap changes
+	composeProv.SetupConfigMapWatcher(ctx, kubeClient)
 
 	if err := n.Run(ctx); err != nil {
 		log.G(ctx).WithError(err).Error("Node exited with error")

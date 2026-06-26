@@ -80,6 +80,36 @@ func (c *SyncClient) Upload(ctx context.Context, targetDir string, composeConten
 	return nil
 }
 
+// UploadFiles uploads only the given extra files (relative to targetDir)
+// without touching docker-compose.yml. Used for incremental updates such
+// as re-syncing ConfigMap/Secret volume files after a change.
+func (c *SyncClient) UploadFiles(ctx context.Context, targetDir string, files []ExtraFile) error {
+	log.G(ctx).WithFields(log.Fields{
+		"target_dir": targetDir,
+		"file_count": len(files),
+	}).Info("SFTP incremental upload starting")
+
+	client, err := c.sftpClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	for _, f := range files {
+		fullPath := filepath.Join(targetDir, f.Path)
+		dir := filepath.Dir(fullPath)
+		if err := client.MkdirAll(dir); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+		if err := c.writeFile(ctx, client, fullPath, f.Content); err != nil {
+			return fmt.Errorf("upload %s: %w", f.Path, err)
+		}
+	}
+
+	log.G(ctx).WithField("target_dir", targetDir).Info("SFTP incremental upload complete")
+	return nil
+}
+
 func (c *SyncClient) sftpClient(ctx context.Context) (*sftp.Client, error) {
 	addr := fmt.Sprintf("%s:%d", c.host, c.port)
 	log.G(ctx).WithField("addr", addr).Debug("SFTP connecting")
