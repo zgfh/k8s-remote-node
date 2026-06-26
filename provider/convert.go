@@ -113,15 +113,15 @@ func convertContainer(c corev1.Container, pod *corev1.Pod, isInit bool) ComposeS
 		}
 	}
 
-	// Volume mounts (configmap/secret files are uploaded separately by the provider)
+	// Volume mounts
 	for _, vm := range c.VolumeMounts {
-		hostPath := volumeDir(vm.Name)
+		srcPath := volumeSourcePath(vm.Name, pod)
 		ro := ""
 		if vm.ReadOnly {
 			ro = ":ro"
 		}
 		svc.Volumes = append(svc.Volumes,
-			fmt.Sprintf("./volumes/%s:%s%s", hostPath, vm.MountPath, ro))
+			fmt.Sprintf("%s:%s%s", srcPath, vm.MountPath, ro))
 	}
 
 	// Command and args
@@ -169,7 +169,18 @@ func restartPolicy(p corev1.RestartPolicy, isInit bool) string {
 	}
 }
 
-// volumeDir returns the directory name for a volume on the remote host.
-func volumeDir(volumeName string) string {
-	return volumeName
+// volumeSourcePath returns the source path for a volume on the remote host.
+// For HostPath volumes, it returns the host path directly.
+// For ConfigMap/Secret/EmptyDir volumes, it returns the path under ./volumes/
+// where the provider places uploaded files.
+func volumeSourcePath(volumeName string, pod *corev1.Pod) string {
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name == volumeName {
+			if vol.HostPath != nil {
+				return vol.HostPath.Path
+			}
+			break
+		}
+	}
+	return "./volumes/" + volumeName
 }
