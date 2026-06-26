@@ -75,6 +75,18 @@ spec:
         - name: data
           mountPath: /data
 
+    - name: blog
+      image: m.daocloud.io/docker.io/library/busybox:latest
+      command:
+        - sh
+        - -c
+        - |
+          FOO=hello
+          echo "${FOO} ${BAR:-world}"
+      volumeMounts:
+        - name: data
+          mountPath: /data
+
   volumes:
     - name: config
       configMap:
@@ -83,6 +95,9 @@ spec:
           - key: default.conf
             path: site.conf
     - name: config2
+      configMap:
+        name: nginx-config
+    - name: config3
       configMap:
         name: nginx-config
     - name: secret

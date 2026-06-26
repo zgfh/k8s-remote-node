@@ -221,7 +221,7 @@ func (p *ComposeProvider) GetPodStatus(ctx context.Context, namespace, name stri
 			Phase: corev1.PodFailed,
 		}, nil
 	}
-	status := parseComposeStatus(ctx, out)
+	status := parseComposeStatus(ctx, namespace+"/"+name, dir, out)
 	logger.WithFields(log.Fields{
 		"phase":         status.Phase,
 		"container_cnt": len(status.ContainerStatuses),
@@ -834,10 +834,23 @@ type composeContainer struct {
 
 // parseComposeStatus parses the JSON output of "docker compose ps --format json"
 // and converts it to a Kubernetes PodStatus.
-func parseComposeStatus(ctx context.Context, out []byte) *corev1.PodStatus {
+func parseComposeStatus(ctx context.Context, podKey, dir string, out []byte) *corev1.PodStatus {
+	logger := log.G(ctx).WithFields(log.Fields{
+		"pod": podKey,
+		"dir": dir,
+	})
+
 	status := &corev1.PodStatus{
 		Phase: corev1.PodRunning,
 	}
+
+	// Strip null bytes that may appear in SSH output
+	out = bytes.Map(func(r rune) rune {
+		if r == 0 {
+			return -1
+		}
+		return r
+	}, out)
 
 	var containers []composeContainer
 
@@ -851,7 +864,7 @@ func parseComposeStatus(ctx context.Context, out []byte) *corev1.PodStatus {
 			}
 			var c composeContainer
 			if err := json.Unmarshal(line, &c); err != nil {
-				log.G(ctx).WithError(err).WithField("line", string(line)).Warn("Failed to parse compose ps output")
+				logger.WithError(err).WithField("line", string(line)).Warn("Failed to parse compose ps output")
 				continue
 			}
 			containers = append(containers, c)
@@ -860,7 +873,7 @@ func parseComposeStatus(ctx context.Context, out []byte) *corev1.PodStatus {
 
 	if len(containers) == 0 {
 		status.Phase = corev1.PodPending
-		log.G(ctx).Debug("parseComposeStatus: no containers found, phase=Pending")
+		logger.Debug("parseComposeStatus: no containers found, phase=Pending")
 		return status
 	}
 
