@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
@@ -128,12 +129,19 @@ func convertContainer(c corev1.Container, pod *corev1.Pod, isInit bool) ComposeS
 			fmt.Sprintf("%s:%s%s", srcPath, vm.MountPath, ro))
 	}
 
-	// Command and args
+	// Command and args — escape $ to $$ so docker-compose doesn't
+	// interpret shell variables (e.g. ${VERSION}) as host env vars.
 	if len(c.Command) > 0 {
-		svc.Entrypoint = c.Command
+		svc.Entrypoint = make([]string, len(c.Command))
+		for i, s := range c.Command {
+			svc.Entrypoint[i] = escapeDollar(s)
+		}
 	}
 	if len(c.Args) > 0 {
-		svc.Command = c.Args
+		svc.Command = make([]string, len(c.Args))
+		for i, s := range c.Args {
+			svc.Command[i] = escapeDollar(s)
+		}
 	}
 
 	// Resource limits
@@ -187,4 +195,10 @@ func volumeSourcePath(volumeName string, pod *corev1.Pod) string {
 		}
 	}
 	return "./volumes/" + volumeName
+}
+
+// escapeDollar escapes $ as $$ so docker-compose variable interpolation
+// passes a literal $ through to the container shell.
+func escapeDollar(s string) string {
+	return strings.ReplaceAll(s, "$", "$$")
 }

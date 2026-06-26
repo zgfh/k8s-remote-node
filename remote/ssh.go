@@ -78,9 +78,8 @@ func (c *SSHClient) connect(ctx context.Context) error {
 // Exec runs a command on the remote node and returns its combined output.
 // It auto-connects if not already connected.
 func (c *SSHClient) Exec(ctx context.Context, cmd string) ([]byte, error) {
-	log.G(ctx).WithFields(log.Fields{
-		"cmd": truncate(cmd, 200),
-	}).Debug("SSH exec")
+	logger := log.G(ctx).WithField("cmd", truncate(cmd, 200))
+	logger.Debug("SSH exec")
 
 	c.mu.Lock()
 	if c.client == nil {
@@ -94,13 +93,13 @@ func (c *SSHClient) Exec(ctx context.Context, cmd string) ([]byte, error) {
 
 	session, err := client.NewSession()
 	if err != nil {
-		log.G(ctx).WithError(err).Warn("SSH session failed, reconnecting")
+		logger.WithError(err).Warn("SSH session failed, reconnecting")
 		// Connection might be stale, try reconnect once
 		c.mu.Lock()
 		c.client = nil
 		if err2 := c.connect(ctx); err2 != nil {
 			c.mu.Unlock()
-			log.G(ctx).WithError(err2).Error("SSH reconnect failed")
+			logger.WithError(err2).Error("SSH reconnect failed")
 			return nil, fmt.Errorf("create session: %w (reconnect: %v)", err, err2)
 		}
 		client = c.client
@@ -108,16 +107,18 @@ func (c *SSHClient) Exec(ctx context.Context, cmd string) ([]byte, error) {
 
 		session, err = client.NewSession()
 		if err != nil {
-			log.G(ctx).WithError(err).Error("SSH create session failed after reconnect")
+			logger.WithError(err).Error("SSH create session failed after reconnect")
 			return nil, fmt.Errorf("create session after reconnect: %w", err)
 		}
-		log.G(ctx).Info("SSH reconnected successfully")
+		logger.Info("SSH reconnected successfully")
 	}
 	defer session.Close()
 
-	var buf bytes.Buffer
-	session.Stdout = &buf
-	session.Stderr = &buf
+	// Use separate buffers because the SSH package copies stdout and stderr
+	// from concurrent goroutines. bytes.Buffer is not safe for concurrent writes.
+	var stdoutBuf, stderrBuf bytes.Buffer
+	session.Stdout = &stdoutBuf
+	session.Stderr = &stderrBuf
 
 	done := make(chan error, 1)
 	go func() {
@@ -128,19 +129,26 @@ func (c *SSHClient) Exec(ctx context.Context, cmd string) ([]byte, error) {
 	select {
 	case <-ctx.Done():
 		session.Signal(ssh.SIGKILL)
-		log.G(ctx).Warn("SSH exec cancelled by context")
+		logger.Warn("SSH exec cancelled by context")
+		// Merge partial output for the cancelled case too
+		var buf bytes.Buffer
+		buf.Write(stdoutBuf.Bytes())
+		buf.Write(stderrBuf.Bytes())
 		return buf.Bytes(), ctx.Err()
 	case execErr = <-done:
 	}
 
+	// Merge stdout and stderr after both goroutines have finished
+	var buf bytes.Buffer
+	buf.Write(stdoutBuf.Bytes())
+	buf.Write(stderrBuf.Bytes())
+
 	if execErr != nil {
-		log.G(ctx).WithFields(log.Fields{
+		logger.WithFields(log.Fields{
 			"output": truncate(buf.String(), 500),
 		}).WithError(execErr).Warn("SSH exec returned error")
 	} else {
-		log.G(ctx).WithFields(log.Fields{
-			"output_len": buf.Len(),
-		}).Debug("SSH exec succeeded")
+		logger.WithField("output_len", buf.Len()).Debug("SSH exec succeeded")
 	}
 
 	return buf.Bytes(), execErr
