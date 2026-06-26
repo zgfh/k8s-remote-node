@@ -116,6 +116,10 @@ func convertContainer(c corev1.Container, pod *corev1.Pod, isInit bool) ComposeS
 	// Volume mounts
 	for _, vm := range c.VolumeMounts {
 		srcPath := volumeSourcePath(vm.Name, pod)
+		// When subPath is set, mount the specific file/subdirectory within the volume
+		if vm.SubPath != "" {
+			srcPath = srcPath + "/" + vm.SubPath
+		}
 		ro := ""
 		if vm.ReadOnly {
 			ro = ":ro"

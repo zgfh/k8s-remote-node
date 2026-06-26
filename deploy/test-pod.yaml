@@ -65,6 +65,9 @@ spec:
           mountPath: /etc/nginx/conf.d
         - name: config2
           mountPath: /tmp/config
+        - name: config3
+          mountPath: /tmp/config3/default.conf
+          subPath: default.conf
         - name: secret
           mountPath: /etc/secret
         - name: cache
