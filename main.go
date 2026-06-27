@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -130,6 +131,12 @@ func main() {
 
 	// Start ConfigMap watcher for automatic volume re-sync on ConfigMap changes
 	composeProv.SetupConfigMapWatcher(ctx, kubeClient)
+
+	// Run startup reconciliation to clean up orphaned remote directories and
+	// import any pods that are still running from a previous controller instance.
+	reconcileCtx, reconcileCancel := context.WithTimeout(ctx, 30*time.Second)
+	composeProv.ReconcileOnStartup(reconcileCtx, kubeClient, nodeName)
+	reconcileCancel()
 
 	if err := n.Run(ctx); err != nil {
 		log.G(ctx).WithError(err).Error("Node exited with error")
