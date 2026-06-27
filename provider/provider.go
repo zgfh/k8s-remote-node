@@ -173,6 +173,45 @@ func (p *ComposeProvider) UpdatePod(ctx context.Context, pod *corev1.Pod) error 
 	return nil
 }
 
+// execWithRetry runs an SSH command with exponential backoff retry.
+// maxRetries is the number of additional attempts after the first one.
+// Backoff: 2s, 4s, 8s, ...
+func (p *ComposeProvider) execWithRetry(ctx context.Context, cmd string, maxRetries int) ([]byte, error) {
+	var lastErr error
+	var lastOut []byte
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			backoff := time.Duration(1<<i) * time.Second
+			log.G(ctx).WithFields(log.Fields{
+				"cmd":     truncateCmd(cmd, 200),
+				"attempt": i + 1,
+				"backoff": backoff,
+			}).Warn("Retrying SSH command")
+			select {
+			case <-ctx.Done():
+				return lastOut, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		out, err := p.sshClient.Exec(ctx, cmd)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		lastOut = out
+	}
+	return lastOut, fmt.Errorf("command failed after %d retries: %w", maxRetries+1, lastErr)
+}
+
+// truncateCmd truncates a command string for logging.
+func truncateCmd(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // DeletePod removes a pod from the remote node.
 func (p *ComposeProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	logger := log.G(ctx).WithFields(log.Fields{
@@ -183,17 +222,38 @@ func (p *ComposeProvider) DeletePod(ctx context.Context, pod *corev1.Pod) error 
 	logger.Info("DeletePod started")
 
 	dir := p.podDir(pod)
-	cmd := fmt.Sprintf("cd %s && docker compose down -v 2>&1; rm -rf %s", dir, dir)
-	out, err := p.sshClient.Exec(ctx, cmd)
-	if err != nil {
-		logger.WithError(err).WithField("output", string(out)).Error("docker compose down failed")
-		return fmt.Errorf("docker compose down: %s: %w", string(out), err)
-	}
-	logger.WithField("output", string(out)).Info("docker compose down succeeded")
+	var cleanupErrs []error
 
+	// Step 1: stop containers (with retry)
+	downCmd := fmt.Sprintf("cd %s && docker compose down -v 2>&1", dir)
+	out, err := p.execWithRetry(ctx, downCmd, 3)
+	if err != nil {
+		logger.WithError(err).WithField("output", string(out)).Error("docker compose down failed after retries")
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("compose down: %w", err))
+	} else {
+		logger.WithField("output", string(out)).Info("docker compose down succeeded")
+	}
+
+	// Step 2: remove directory (best-effort, attempted even if step 1 failed)
+	rmCmd := fmt.Sprintf("rm -rf %s 2>&1", dir)
+	out, err = p.execWithRetry(ctx, rmCmd, 3)
+	if err != nil {
+		logger.WithError(err).WithField("output", string(out)).Error("rm -rf directory failed after retries")
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("rm -rf: %w", err))
+	} else {
+		logger.WithField("output", string(out)).Info("rm -rf directory succeeded")
+	}
+
+	// Always clean up in-memory state (K8s has already deleted the pod object;
+	// the startup reconciler will clean up any remaining remote artifacts)
 	p.pods.Delete(podKey(pod.Namespace, pod.Name))
 	p.removePodFromCMs(podKey(pod.Namespace, pod.Name))
 	p.removePodFromSecrets(podKey(pod.Namespace, pod.Name))
+
+	if len(cleanupErrs) > 0 {
+		logger.WithField("errors", cleanupErrs).Warn("DeletePod completed with remote cleanup errors (startup reconciler will retry)")
+		return fmt.Errorf("DeletePod cleanup errors: %v", cleanupErrs)
+	}
 	logger.Info("DeletePod completed")
 	return nil
 }
@@ -514,6 +574,107 @@ func (p *ComposeProvider) removePodFromSecrets(podKey string) {
 			delete(p.secretToPods, secretKey)
 		}
 	}
+}
+
+// ReconcileOnStartup scans the remote node's WorkDir for existing
+// docker-compose directories, stops and removes containers for pods that no
+// longer exist in Kubernetes, and imports still-existing pods into the
+// in-memory cache so the status sync loop can track them.
+func (p *ComposeProvider) ReconcileOnStartup(ctx context.Context, client kubernetes.Interface, nodeName string) {
+	logger := log.G(ctx).WithFields(log.Fields{
+		"host":      p.cfg.Host,
+		"node_name": nodeName,
+	})
+	logger.Info("Startup reconciliation started")
+
+	// 1. Discover existing pod directories on the remote host.
+	findCmd := fmt.Sprintf("find %s -mindepth 3 -maxdepth 3 -name docker-compose.yml 2>&1", p.cfg.WorkDir)
+	out, err := p.sshClient.Exec(ctx, findCmd)
+	if err != nil {
+		logger.WithError(err).WithField("output", string(out)).Error("Startup reconciliation: failed to list remote directories")
+		return
+	}
+
+	remoteDirs := make(map[string]string) // "ns/pod" -> "/opt/vk-pods/ns/pod"
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// line: /opt/vk-pods/namespace/pod-name/docker-compose.yml
+		dir := filepath.Dir(line)
+		relPath := strings.TrimPrefix(dir, p.cfg.WorkDir+"/")
+		parts := strings.SplitN(relPath, "/", 2)
+		if len(parts) == 2 {
+			remoteDirs[podKey(parts[0], parts[1])] = dir
+		}
+	}
+
+	if len(remoteDirs) == 0 {
+		logger.Info("Startup reconciliation: no existing pod directories found")
+		return
+	}
+	logger.WithField("count", len(remoteDirs)).Info("Startup reconciliation: found existing pod directories")
+
+	// 2. List all pods assigned to this virtual node.
+	pods, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+	})
+	if err != nil {
+		logger.WithError(err).Error("Startup reconciliation: failed to list pods from Kubernetes, skipping cleanup")
+		return
+	}
+
+	k8sPods := make(map[string]*corev1.Pod) // "ns/name" -> *corev1.Pod
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		k8sPods[podKey(pod.Namespace, pod.Name)] = pod
+	}
+	logger.WithField("count", len(k8sPods)).Info("Startup reconciliation: pods found in Kubernetes")
+
+	// 3. Reconcile: import existing pods, clean up orphans.
+	var imported, cleaned int
+	for key, dir := range remoteDirs {
+		if k8sPod, exists := k8sPods[key]; exists {
+			// Pod still exists in K8s — import into in-memory cache.
+			p.pods.Store(key, k8sPod.DeepCopy())
+			logger.WithField("pod", key).Info("Startup reconciliation: imported existing pod into cache")
+			imported++
+
+			// Also restore ConfigMap/Secret tracking.
+			for _, vol := range k8sPod.Spec.Volumes {
+				switch {
+				case vol.ConfigMap != nil:
+					p.recordCMUsage(podKey(k8sPod.Namespace, vol.ConfigMap.Name), key)
+				case vol.Secret != nil:
+					p.recordSecretUsage(podKey(k8sPod.Namespace, vol.Secret.SecretName), key)
+				}
+			}
+		} else {
+			// Pod no longer exists in K8s — clean up.
+			logger.WithField("pod", key).WithField("dir", dir).Info("Startup reconciliation: cleaning up orphaned directory")
+
+			downCmd := fmt.Sprintf("cd %s && docker compose down -v 2>&1", dir)
+			downOut, downErr := p.sshClient.Exec(ctx, downCmd)
+			if downErr != nil {
+				logger.WithError(downErr).WithField("output", string(downOut)).WithField("pod", key).Warn("Startup reconciliation: compose down failed, still attempting rm")
+			}
+
+			rmCmd := fmt.Sprintf("rm -rf %s 2>&1", dir)
+			rmOut, rmErr := p.sshClient.Exec(ctx, rmCmd)
+			if rmErr != nil {
+				logger.WithError(rmErr).WithField("output", string(rmOut)).WithField("pod", key).Error("Startup reconciliation: rm -rf failed")
+			} else {
+				cleaned++
+			}
+		}
+	}
+
+	logger.WithFields(log.Fields{
+		"imported": imported,
+		"cleaned":  cleaned,
+		"total":    len(remoteDirs),
+	}).Info("Startup reconciliation completed")
 }
 
 // SetupConfigMapWatcher starts ConfigMap and Secret informers that watch for
