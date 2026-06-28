@@ -132,9 +132,32 @@ func (p *ComposeProvider) CreatePod(ctx context.Context, pod *corev1.Pod) error 
 
 	// 5. Cache pod as Running
 	cached := pod.DeepCopy()
+	now := metav1.Now()
 	cached.Status = corev1.PodStatus{
 		Phase:     corev1.PodRunning,
-		StartTime: &metav1.Time{Time: time.Now()},
+		StartTime: &metav1.Time{Time: now.Time},
+		Conditions: []corev1.PodCondition{
+			{
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+			},
+			{
+				Type:               corev1.PodInitialized,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+			},
+			{
+				Type:               corev1.ContainersReady,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+			},
+			{
+				Type:               corev1.PodReady,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+			},
+		},
 	}
 	for _, c := range pod.Spec.Containers {
 		cached.Status.ContainerStatuses = append(cached.Status.ContainerStatuses, corev1.ContainerStatus{
@@ -1081,11 +1104,50 @@ func parseComposeStatus(ctx context.Context, podKey, dir string, out []byte) *co
 		status.Phase = corev1.PodFailed
 	}
 
+	// Set pod conditions based on container states.
+	allReady := true
+	for _, cs := range status.ContainerStatuses {
+		if !cs.Ready {
+			allReady = false
+			break
+		}
+	}
+	now := metav1.Now()
+	status.Conditions = []corev1.PodCondition{
+		{
+			Type:               corev1.PodScheduled,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               corev1.PodInitialized,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+		},
+		{
+			Type:               corev1.ContainersReady,
+			Status:             boolToCondition(allReady),
+			LastTransitionTime: now,
+		},
+		{
+			Type:               corev1.PodReady,
+			Status:             boolToCondition(allReady),
+			LastTransitionTime: now,
+		},
+	}
+
 	return status
 }
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func boolToCondition(b bool) corev1.ConditionStatus {
+	if b {
+		return corev1.ConditionTrue
+	}
+	return corev1.ConditionFalse
 }
 
 // joinCmd joins a command slice into a shell-safe string.
